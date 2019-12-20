@@ -1,4 +1,4 @@
-from vimeo_data import __version__
+from recurly_data import __version__
 
 
 def test_version():
