@@ -1,18 +1,23 @@
-""" Vimeo Data. """
+"""Recurly Data."""
 # pylint: disable=import-error,wildcard-import,unused-wildcard-import
 import csv
-from datetime import timezone
+from datetime import datetime, timezone
+import os
 from typing import Dict, List, Optional, Union
 import json
 import recurly
 import requests
 from colorama import init, Fore, Back, Style
 from tqdm import tqdm
-from recurly_data.config import RECURLY_KEY, STRIPE_KEY, STRIPE_API, SENTRY
+import sentry_sdk
+from recurly_data.config import (
+    RECURLY_API, RECURLY_KEY, STRIPE_KEY, STRIPE_API, SENTRY
+)
 #from recurly_data.logger import Logger
-#import sentry_sdk
 init(autoreset=True)
-#sentry_sdk.init(SENTRY)
+
+if SENTRY:
+    sentry_sdk.init(SENTRY)
 
 
 # pylint: disable=too-many-instance-attributes
@@ -28,6 +33,11 @@ class RecurlyData:
             silence: Union[int, bool] = False,
             verbose: Union[int, bool] = False,
             filename: str = "recurly_data.csv",
+            begin_time: Optional[str] = None,
+            end_time: Optional[str] = None,
+            order: str = "asc",
+            subscription_state: str = "live",
+            api: Optional[str] = RECURLY_API,
             api_key: Optional[str] = RECURLY_KEY,
             stripe_key: Optional[str] = STRIPE_KEY,
             stripe_api: Optional[str] = STRIPE_API,
@@ -36,108 +46,283 @@ class RecurlyData:
         self.limit = limit
         self.silence = silence
         self.verbose = int(verbose)
-        self.filename = filename
+        self.filename = os.path.abspath(
+            os.path.expanduser(
+                os.path.expandvars(
+                    filename
+                )
+            )
+        )
+        self.begin_time = begin_time
+        self.end_time = end_time
+        self.order = order
+        self.subscription_state = subscription_state
+        self.api = api
         self.api_key = api_key
         self.stripe_key = stripe_key
         self.stripe_api = stripe_api
         self.client = recurly.Client(self.api_key)
         self.recurly_data: List[Dict[str, Union[str, int]]] = []
+        self.total_accounts = 0
+        self.api_limit_reset_time: Union[int, float, datetime] = 0
+        self.api_limit: int = 0
+        self.api_limit_remaining: int = 0
+        self.total_extracted: int = 0
+        self.call_recurly_api("headers")
+        self.last_row: Optional[dict] = None
+        print(self.total_extracted)
+        self.__continue_extraction()
+        print(self.total_extracted)
+        self.progress_bar: tqdm = self.__progress_bar()
+        exit()
+
+    def __continue_extraction(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, "rb") as f:
+                # Read first line for columns
+                columns = f.readline().decode().strip().split(",")
+                # Read second line as first row
+                first_row = f.readline().decode().strip().split(",")
+                # Jump to the second last byte.
+                f.seek(-2, os.SEEK_END)
+                # Until EOL is found...
+                while f.read(1) != b"\n":
+                    # jump back the read byte plus one more.
+                    f.seek(-2, os.SEEK_CUR)
+                # Read last line.
+                last_row = f.readline().decode().strip().split(",")
+            first = dict(zip(columns, first_row))
+            last = dict(zip(columns, last_row))
+            self.last_row = last
+            frst_ct = float(first["created_at"])
+            lst_ct = float(last["created_at"])
+            self.total_extracted = int(last["row"])
+            last_created_at = datetime.utcfromtimestamp(lst_ct).isoformat()
+            if frst_ct > lst_ct:
+                # Last iteration ran in desc order, so update end_time.
+                self.end_time = last_created_at
+            else:
+                # Last iteration ran in asc order, so update begin_time.
+                self.begin_time = last_created_at
+
+
+    def call_recurly_api(self, endpoint: str, **params):
+        """A convenient way to call recurly api with an endpoint."""
+        allowed_endpoints = [
+            "headers", "accounts", "subscriptions", "redemptions"
+        ]
+
+        if endpoint not in allowed_endpoints:
+            msg = f"Allowed endpoints are {', '.join(allowed_endpoints)}."
+            raise Exception(msg)
+
+        try:
+            if endpoint == "headers":
+                response = self.__header_response()
+            elif endpoint == "accounts":
+                # refresh counts
+                self.__header_response()
+                response = self.client.list_accounts(**params).items()
+            elif endpoint == "subscriptions":
+                response = self.client.list_account_subscriptions(
+                    **params
+                ).items()
+            elif endpoint == "redemptions":
+                response = self.client.list_account_coupon_redemptions(
+                    **params
+                ).items()
+        except recurly.errors.ValidationError as excpt:
+            print("here")
+            print(f"ValidationError: {excpt.error.message}")
+            print(excpt.error.params)
+        except recurly.errors.NotFoundError as excpt:
+            print(f"NotFoundError: {excpt}")
+        except recurly.errors.ApiError as excpt:
+            print(f"ApiError: {excpt}")
+        except recurly.NetworkError as excpt:
+            print(f"NetworkError: {excpt}")
+        else:
+            return response
+
+    def __header_response(self):
+        """Get information from headers."""
+        status = False
+
+        if self.api_key:
+            response = requests.head(
+                self.api + "/accounts",
+                auth=(self.api_key, "")
+            )
+
+            if response.status_code == 200:
+                status = True
+                self.total_accounts = int(response.headers["X-Records"])
+                self.api_limit = int(response.headers["X-RateLimit-Limit"])
+                self.api_limit_remaining = int(
+                    response.headers["X-RateLimit-Remaining"]
+                )
+                self.api_limit_reset_time = (
+                    datetime.fromtimestamp(
+                        int(response.headers["X-RateLimit-Reset"])
+                    )
+                )
+
+        return status
+
+    def get_first_account_datetime(self):
+        """Get datetime of the first record."""
+        accounts = self.get_accounts(order="asc")
+        # TODO: Catch exception recurly.ApiError, AttributeError etc
+        account = next(accounts)
+        return account.created_at
+
+    def get_accounts(self, **params):
+        """Get recurly accounts iterator object."""
+        params["endpoint"] = "accounts"
+
+        if "order" not in params:
+            params["order"] = self.order
+
+        if "begin_time" not in params and self.begin_time:
+            params["begin_time"] = self.begin_time
+
+        if "end_time" not in params and self.end_time:
+            params["end_time"] = self.end_time
+
+        return self.call_recurly_api(**params)
+
+    def get_account_subscriptions(self, account_id: str, **params):
+        """Get recurly account's subscriptions iterator object."""
+        params["account_id"] = account_id
+        params["endpoint"] = "subscriptions"
+        if "state" not in params:
+            params["state"] = self.subscription_state
+
+        return self.call_recurly_api(**params)
+
+    def get_account_redemptions(self, account_id: str, **params):
+        """Get recurly account's redemptions iterator object."""
+        params["account_id"] = account_id
+        params["endpoint"] = "redemptions"
+        return self.call_recurly_api(**params)
+
+    def __progress_bar(self):
+        ncols = 100
+        total = None
+        if self.limit:
+            total = self.limit
+        elif not self.begin_time and not self.end_time:
+            total = self.total_accounts - self.total_extracted
+            print(self.total_accounts)
+            print(self.total_extracted)
+            print(total)
+        # todo: pick up from here 
+        print(self.total_accounts)
+        print(self.total_extracted)
+
+        pnct_bar = "{percentage:3.0f}% " + Fore.GREEN + "{bar}" + Fore.RESET
+        extr = "Extracted: " + Fore.YELLOW + "{n_fmt}/{total_fmt}" + Fore.RESET
+        elps = "Elapsed: " + Fore.YELLOW + "{elapsed}<{remaining}" + Fore.RESET
+        rate = "Rate: " + Fore.YELLOW + "{rate_fmt}" + Fore.RESET
+
+        if not self.verbose:
+            bar_format = pnct_bar + "|"
+        else:
+            bar_format = f"{pnct_bar} | {extr} | {elps} | {rate}"
+
+        return tqdm(
+            total=total,
+            ncols=ncols,
+            bar_format=bar_format,
+            disable=self.silence,
+        )
+
+    @staticmethod
+    def __get_timestamp(dt: datetime):
+        return dt.replace(
+            tzinfo=timezone.utc
+        ).timestamp()
 
     # pylint: disable=too-many-locals,too-many-branches
-    def extract_data(self):
+    def extract_data(self, **params):
         """Extract customer data."""
-        accounts = self.client.list_accounts()
 
-        columns = ["email", "name", "stripe_id", "frequency", "pricing_amount",
-                   "next_billing_date", "cancel_date", "active_promo_code",
-                   "pending_change"]
-        rows = []
-        i = 0
+        idx, columns = 0, [
+            "row", "email", "name", "stripe_id", "created_at", "frequency",
+            "pricing_amount", "next_billing_date", "cancel_date",
+            "active_promo_code", "pending_change"
+        ]
 
-        with tqdm(
-                dynamic_ncols=True,
-                bar_format=(
-                    "Extracted: " + Fore.YELLOW + "{n_fmt}" + Fore.RESET + " | "
-                    "Time elapsed: " + Fore.YELLOW + "{elapsed}" + Fore.RESET + " | "
-                    "Rate: " + Fore.YELLOW + "{rate_fmt}"
-                ),
-                disable=self.silence
-        ) as pbar:
-            for account in accounts.items():
+        with self.progress_bar as pbar:
+            for account in self.get_accounts(**params):
                 row = {column: "" for column in columns}
 
+                if (
+                    self.last_row and
+                    self.last_row["email"] == account.email
+                ):
+                    continue
+
+                account_id = account.id
                 row["email"] = account.email
                 if account.first_name:
                     row["name"] = account.first_name
                 if account.last_name:
                     row["name"] = f"{row['name']} {account.last_name}"
                 row["stripe_id"] = self.get_assoc_stripe_id(account.email)
-                try:
-                    subscriptions = self.client.list_account_subscriptions(
-                        account.id, state="live"
-                    )
-                    for subscription in subscriptions.items():
-                        row["frequency"] = subscription.plan.name.split(' ')[0]
-                        row["pricing_amount"] = subscription.unit_amount
-                        nbd = subscription.current_term_ends_at
-                        if nbd:
-                            nbd_timestamp = nbd.replace(
-                                tzinfo=timezone.utc
-                            ).timestamp()
-                            row["next_billing_date"] = nbd_timestamp
-                        cncd = subscription.canceled_at
-                        if cncd:
-                            cncd_timestamp = cncd.replace(
-                                tzinfo=timezone.utc
-                            ).timestamp()
-                            row["cancel_date"] = cncd_timestamp
-                        pending_change = subscription.pending_change
-                        if pending_change:
-                            row["pending_change"] = (
-                                self.compact_pending_change(pending_change)
-                            )
-                except recurly.errors.NotFoundError as excpt:
-                    pass
-                    # Logger().error(str(excpt))
+                row["created_at"] = self.__get_timestamp(account.created_at)
 
-                try:
-                    redemptions = self.client.list_account_coupon_redemptions(
-                        account.id
-                    )
-                    for redemption in redemptions.items():
-                        if redemption.state == "active":
-                            row["active_promo_code"] = redemption.coupon.code
-                except recurly.errors.NotFoundError as excpt:
-                    pass
-                    # Logger().error(str(excpt))
+                for subscription in self.get_account_subscriptions(account_id):
+                    row["frequency"] = subscription.plan.name.split(' ')[0]
+                    row["pricing_amount"] = subscription.unit_amount
+                    nbd = subscription.current_term_ends_at
+                    if nbd:
+                        row["next_billing_date"] = self.__get_timestamp(nbd)
+                    cncd = subscription.canceled_at
+                    if cncd:
+                        row["cancel_date"] = self.__get_timestamp(cncd)
+                    pending_change = subscription.pending_change
+                    if pending_change:
+                        row["pending_change"] = (
+                            self.compact_pending_change(pending_change)
+                        )
 
-                if self.limit and i == self.limit:
+                for redemption in self.get_account_redemptions(account_id):
+                    if redemption.state == "active":
+                        row["active_promo_code"] = redemption.coupon.code
+
+                self.recurly_data.append(row)
+                idx += 1
+                self.total_extracted += 1
+                row["row"] = self.total_extracted
+                item_count = 0
+                for key, item in row.items():
+                    item_count += 1
+                    if key == "pending_change":
+                        item = "yes" if item else ""
+                    pbar.display(msg=f" {key}: {Fore.CYAN}{item}", pos=item_count)
+                    pbar.refresh()
+                pbar.update()
+                if self.limit and idx == self.limit:
                     break
 
-                rows.append(row)
-                i += 1
-
-                if self.verbose:
-                    msg = Fore.GREEN + row['email']
-                    pbar.display(msg=msg, pos=1)
-
-                pbar.update()
-                # Logger().info(json.dumps(row))
-
-        self.recurly_data = rows
 
     def make_csv(self):
         """Make  a csv file from extracted data."""
-        if not self.recurly_data:
+        try:
             self.extract_data()
-
-        if self.recurly_data:
-            with open('recurly_data.csv', mode='w') as csv_file:
-                fieldnames = self.recurly_data[0].keys()
-                writer = csv.DictWriter(csv_file, fieldnames)
-                writer.writeheader()
-                for row in self.recurly_data:
-                    writer.writerow(row)
+        except KeyboardInterrupt as excpt:
+            print(str(excpt))
+        finally:
+            if self.recurly_data:
+                mode = "a" if os.path.exists(self.filename) else "w"
+                fieldnames = list(self.recurly_data[0].keys())
+                with open(self.filename, mode=mode) as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                    if mode == "w":
+                        writer.writeheader()
+                    for row in self.recurly_data:
+                        writer.writerow(row)
 
     @staticmethod
     def compact_pending_change(obj):
@@ -159,7 +344,7 @@ class RecurlyData:
         cst_id = ""
         if self.stripe_api:
             item = requests.get(
-                self.stripe_api,
+                self.stripe_api + "/customers",
                 auth=(self.stripe_key, ""),
                 params={"email": email}
             )
