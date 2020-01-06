@@ -13,6 +13,7 @@ import sentry_sdk
 from recurly_data.config import (
     RECURLY_API, RECURLY_KEY, STRIPE_KEY, STRIPE_API, SENTRY
 )
+import pickle
 #from recurly_data.logger import Logger
 init(autoreset=True)
 
@@ -25,6 +26,37 @@ class RecurlyData:
     """
     Recurly data.
     """
+
+    @staticmethod
+    def __get_timestamp(dt: datetime):
+        return dt.replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+
+    def __header_response(self):
+        """Get information from headers."""
+        status = False
+
+        if self.api_key:
+            response = requests.head(
+                self.api + "/accounts",
+                auth=(self.api_key, "")
+            )
+
+            if response.status_code == 200:
+                status = True
+                self.api_total_accounts = int(response.headers["X-Records"])
+                self.api_limit = int(response.headers["X-RateLimit-Limit"])
+                self.api_limit_remaining = int(
+                    response.headers["X-RateLimit-Remaining"]
+                )
+                self.api_limit_reset_time = (
+                    datetime.fromtimestamp(
+                        int(response.headers["X-RateLimit-Reset"])
+                    )
+                )
+
+        return status
 
     # pylint: disable=too-many-arguments
     def __init__(
@@ -41,6 +73,7 @@ class RecurlyData:
             api_key: Optional[str] = RECURLY_KEY,
             stripe_key: Optional[str] = STRIPE_KEY,
             stripe_api: Optional[str] = STRIPE_API,
+            total_remaining: Optional[int] = None,
     ):
         # Set the keys and values
         self.limit = limit
@@ -53,6 +86,7 @@ class RecurlyData:
                 )
             )
         )
+        self.__pickle = "script_info.pickle"
         self.begin_time = begin_time
         self.end_time = end_time
         self.order = order
@@ -61,50 +95,42 @@ class RecurlyData:
         self.api_key = api_key
         self.stripe_key = stripe_key
         self.stripe_api = stripe_api
+        self.total_remaining = total_remaining
         self.client = recurly.Client(self.api_key)
         self.recurly_data: List[Dict[str, Union[str, int]]] = []
-        self.total_accounts = 0
+        self.api_total_accounts = 0
         self.api_limit_reset_time: Union[int, float, datetime] = 0
         self.api_limit: int = 0
         self.api_limit_remaining: int = 0
-        self.total_extracted: int = 0
         self.call_recurly_api("headers")
-        self.last_row: Optional[dict] = None
-        print(self.total_extracted)
-        self.__continue_extraction()
-        print(self.total_extracted)
         self.progress_bar: tqdm = self.__progress_bar()
-        exit()
 
-    def __continue_extraction(self):
-        if os.path.exists(self.filename):
-            with open(self.filename, "rb") as f:
-                # Read first line for columns
-                columns = f.readline().decode().strip().split(",")
-                # Read second line as first row
-                first_row = f.readline().decode().strip().split(",")
-                # Jump to the second last byte.
-                f.seek(-2, os.SEEK_END)
-                # Until EOL is found...
-                while f.read(1) != b"\n":
-                    # jump back the read byte plus one more.
-                    f.seek(-2, os.SEEK_CUR)
-                # Read last line.
-                last_row = f.readline().decode().strip().split(",")
-            first = dict(zip(columns, first_row))
-            last = dict(zip(columns, last_row))
-            self.last_row = last
-            frst_ct = float(first["created_at"])
-            lst_ct = float(last["created_at"])
-            self.total_extracted = int(last["row"])
-            last_created_at = datetime.utcfromtimestamp(lst_ct).isoformat()
-            if frst_ct > lst_ct:
-                # Last iteration ran in desc order, so update end_time.
-                self.end_time = last_created_at
-            else:
-                # Last iteration ran in asc order, so update begin_time.
-                self.begin_time = last_created_at
+    def __progress_bar(self):
+        ncols = 100
+        total = None
+        if self.total_remaining:
+            total = self.total_remaining
+        elif self.limit:
+            total = self.limit
+        elif not self.begin_time and not self.end_time:
+            total = self.api_total_accounts
 
+        pnct_bar = "{percentage:3.0f}% " + Fore.GREEN + "{bar}" + Fore.RESET
+        extr = "Extracted: " + Fore.YELLOW + "{n_fmt}/{total_fmt}" + Fore.RESET
+        elps = "Elapsed: " + Fore.YELLOW + "{elapsed}<{remaining}" + Fore.RESET
+        rate = "Rate: " + Fore.YELLOW + "{rate_fmt}" + Fore.RESET
+
+        if not self.verbose:
+            bar_format = pnct_bar + "|"
+        else:
+            bar_format = f"{pnct_bar} | {extr} | {elps} | {rate}"
+
+        return tqdm(
+            total=total,
+            ncols=ncols,
+            bar_format=bar_format,
+            disable=self.silence,
+        )
 
     def call_recurly_api(self, endpoint: str, **params):
         """A convenient way to call recurly api with an endpoint."""
@@ -144,104 +170,18 @@ class RecurlyData:
         else:
             return response
 
-    def __header_response(self):
-        """Get information from headers."""
-        status = False
-
-        if self.api_key:
-            response = requests.head(
-                self.api + "/accounts",
-                auth=(self.api_key, "")
-            )
-
-            if response.status_code == 200:
-                status = True
-                self.total_accounts = int(response.headers["X-Records"])
-                self.api_limit = int(response.headers["X-RateLimit-Limit"])
-                self.api_limit_remaining = int(
-                    response.headers["X-RateLimit-Remaining"]
-                )
-                self.api_limit_reset_time = (
-                    datetime.fromtimestamp(
-                        int(response.headers["X-RateLimit-Reset"])
-                    )
-                )
-
-        return status
-
-    def get_first_account_datetime(self):
-        """Get datetime of the first record."""
-        accounts = self.get_accounts(order="asc")
-        # TODO: Catch exception recurly.ApiError, AttributeError etc
-        account = next(accounts)
-        return account.created_at
-
-    def get_accounts(self, **params):
-        """Get recurly accounts iterator object."""
-        params["endpoint"] = "accounts"
-
-        if "order" not in params:
-            params["order"] = self.order
-
-        if "begin_time" not in params and self.begin_time:
-            params["begin_time"] = self.begin_time
-
-        if "end_time" not in params and self.end_time:
-            params["end_time"] = self.end_time
-
-        return self.call_recurly_api(**params)
-
-    def get_account_subscriptions(self, account_id: str, **params):
-        """Get recurly account's subscriptions iterator object."""
-        params["account_id"] = account_id
-        params["endpoint"] = "subscriptions"
-        if "state" not in params:
-            params["state"] = self.subscription_state
-
-        return self.call_recurly_api(**params)
-
-    def get_account_redemptions(self, account_id: str, **params):
-        """Get recurly account's redemptions iterator object."""
-        params["account_id"] = account_id
-        params["endpoint"] = "redemptions"
-        return self.call_recurly_api(**params)
-
-    def __progress_bar(self):
-        ncols = 100
-        total = None
-        if self.limit:
-            total = self.limit
-        elif not self.begin_time and not self.end_time:
-            total = self.total_accounts - self.total_extracted
-            print(self.total_accounts)
-            print(self.total_extracted)
-            print(total)
-        # todo: pick up from here 
-        print(self.total_accounts)
-        print(self.total_extracted)
-
-        pnct_bar = "{percentage:3.0f}% " + Fore.GREEN + "{bar}" + Fore.RESET
-        extr = "Extracted: " + Fore.YELLOW + "{n_fmt}/{total_fmt}" + Fore.RESET
-        elps = "Elapsed: " + Fore.YELLOW + "{elapsed}<{remaining}" + Fore.RESET
-        rate = "Rate: " + Fore.YELLOW + "{rate_fmt}" + Fore.RESET
-
-        if not self.verbose:
-            bar_format = pnct_bar + "|"
-        else:
-            bar_format = f"{pnct_bar} | {extr} | {elps} | {rate}"
-
-        return tqdm(
-            total=total,
-            ncols=ncols,
-            bar_format=bar_format,
-            disable=self.silence,
-        )
-
     @staticmethod
-    def __get_timestamp(dt: datetime):
-        return dt.replace(
-            tzinfo=timezone.utc
-        ).timestamp()
+    def compact_pending_change(obj):
+        """Dictionary of compact pending change info."""
+        activate_at = obj.activate_at.replace(tzinfo=timezone.utc).timestamp()
+        return {
+            "subject": obj.object,
+            "new_plan_code": obj.plan.code,
+            "new_plan_frequency": obj.plan.name.split(' ')[0],
+            "new_plan_pricing_amount": obj.unit_amount,
+            "new_plan_activate_at": activate_at,
+            "new_plan_activated": obj.activated
+        }
 
     # pylint: disable=too-many-locals,too-many-branches
     def extract_data(self, **params):
@@ -257,11 +197,11 @@ class RecurlyData:
             for account in self.get_accounts(**params):
                 row = {column: "" for column in columns}
 
-                if (
-                    self.last_row and
-                    self.last_row["email"] == account.email
-                ):
-                    continue
+                # if (
+                #     self.last_row and
+                #     self.last_row["email"] == account.email
+                # ):
+                #     continue
 
                 account_id = account.id
                 row["email"] = account.email
@@ -293,8 +233,7 @@ class RecurlyData:
 
                 self.recurly_data.append(row)
                 idx += 1
-                self.total_extracted += 1
-                row["row"] = self.total_extracted
+                row["row"] = idx
                 item_count = 0
                 for key, item in row.items():
                     item_count += 1
@@ -306,36 +245,35 @@ class RecurlyData:
                 if self.limit and idx == self.limit:
                     break
 
+    def get_account_redemptions(self, account_id: str, **params):
+        """Get recurly account's redemptions iterator object."""
+        params["account_id"] = account_id
+        params["endpoint"] = "redemptions"
+        return self.call_recurly_api(**params)
 
-    def make_csv(self):
-        """Make  a csv file from extracted data."""
-        try:
-            self.extract_data()
-        except KeyboardInterrupt as excpt:
-            print(str(excpt))
-        finally:
-            if self.recurly_data:
-                mode = "a" if os.path.exists(self.filename) else "w"
-                fieldnames = list(self.recurly_data[0].keys())
-                with open(self.filename, mode=mode) as csv_file:
-                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                    if mode == "w":
-                        writer.writeheader()
-                    for row in self.recurly_data:
-                        writer.writerow(row)
+    def get_account_subscriptions(self, account_id: str, **params):
+        """Get recurly account's subscriptions iterator object."""
+        params["account_id"] = account_id
+        params["endpoint"] = "subscriptions"
+        if "state" not in params:
+            params["state"] = self.subscription_state
 
-    @staticmethod
-    def compact_pending_change(obj):
-        """Dictionary of compact pending change info."""
-        activate_at = obj.activate_at.replace(tzinfo=timezone.utc).timestamp()
-        return {
-            "subject": obj.object,
-            "new_plan_code": obj.plan.code,
-            "new_plan_frequency": obj.plan.name.split(' ')[0],
-            "new_plan_pricing_amount": obj.unit_amount,
-            "new_plan_activate_at": activate_at,
-            "new_plan_activated": obj.activated
-        }
+        return self.call_recurly_api(**params)
+
+    def get_accounts(self, **params):
+        """Get recurly accounts iterator object."""
+        params["endpoint"] = "accounts"
+
+        if "order" not in params:
+            params["order"] = self.order
+
+        if "begin_time" not in params and self.begin_time:
+            params["begin_time"] = self.begin_time
+
+        if "end_time" not in params and self.end_time:
+            params["end_time"] = self.end_time
+
+        return self.call_recurly_api(**params)
 
     def get_assoc_stripe_id(self, email: str) -> Optional[str]:
         """
@@ -355,3 +293,30 @@ class RecurlyData:
                     cst_id = data[0]["id"]
 
         return cst_id
+
+    def get_first_account_datetime(self):
+        """Get datetime of the first record."""
+        accounts = self.get_accounts(order="asc")
+        # TODO: Catch exception recurly.ApiError, AttributeError etc
+        account = next(accounts)
+        return account.created_at
+
+    def make_csv(self):
+        """Make  a csv file from extracted data."""
+        try:
+            self.extract_data()
+        except KeyboardInterrupt as excpt:
+            print(str(excpt))
+        finally:
+            last_row = False
+            if self.recurly_data:
+                total_rows = len(self.recurly_data) - 1
+                last_row = self.recurly_data[total_rows]
+                mode = "a" if os.path.exists(self.filename) else "w"
+                fieldnames = list(self.recurly_data[0].keys())
+                with open(self.filename, mode=mode) as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                    if mode == "w":
+                        writer.writeheader()
+                    for row in self.recurly_data:
+                        writer.writerow(row)
