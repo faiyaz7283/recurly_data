@@ -27,12 +27,6 @@ class RecurlyData:
     Recurly data.
     """
 
-    @staticmethod
-    def __get_timestamp(dt: datetime):
-        return dt.replace(
-            tzinfo=timezone.utc
-        ).timestamp()
-
     def __header_response(self):
         """Get information from headers."""
         status = False
@@ -148,7 +142,7 @@ class RecurlyData:
             elif endpoint == "accounts":
                 # refresh counts
                 self.__header_response()
-                response = self.client.list_accounts(**params).items()
+                response = self.client.list_accounts(**params, subscriber="true").items()
             elif endpoint == "subscriptions":
                 response = self.client.list_account_subscriptions(
                     **params
@@ -173,13 +167,12 @@ class RecurlyData:
     @staticmethod
     def compact_pending_change(obj):
         """Dictionary of compact pending change info."""
-        activate_at = obj.activate_at.replace(tzinfo=timezone.utc).timestamp()
         return {
             "subject": obj.object,
             "new_plan_code": obj.plan.code,
-            "new_plan_frequency": obj.plan.name.split(' ')[0],
-            "new_plan_pricing_amount": obj.unit_amount,
-            "new_plan_activate_at": activate_at,
+            "new_plan_frequency": RecurlyData.get_frequency_name(obj.plan.name),
+            "new_plan_pricing_amount": int(obj.unit_amount * 100),
+            "new_plan_activate_at": str(obj.activate_at),
             "new_plan_activated": obj.activated
         }
 
@@ -189,8 +182,8 @@ class RecurlyData:
 
         idx, columns = 0, [
             "row", "email", "name", "stripe_id", "created_at", "frequency",
-            "pricing_amount", "next_billing_date", "cancel_date",
-            "active_promo_code", "pending_change"
+            "pricing_amount", "discounted_pricing_amount", "next_billing_date",
+            "cancel_date", "active_promo_code", "pending_change"
         ]
 
         with self.progress_bar as pbar:
@@ -210,17 +203,18 @@ class RecurlyData:
                 if account.last_name:
                     row["name"] = f"{row['name']} {account.last_name}"
                 row["stripe_id"] = self.get_assoc_stripe_id(account.email)
-                row["created_at"] = self.__get_timestamp(account.created_at)
+                row["created_at"] = str(account.created_at)
 
                 for subscription in self.get_account_subscriptions(account_id):
-                    row["frequency"] = subscription.plan.name.split(' ')[0]
-                    row["pricing_amount"] = subscription.unit_amount
+                    row["frequency"] = self.get_frequency_name(subscription.plan.name)
+                    row["pricing_amount"] = int(subscription.unit_amount * 100)
                     nbd = subscription.current_term_ends_at
                     if nbd:
-                        row["next_billing_date"] = self.__get_timestamp(nbd)
+                        row["next_billing_date"] = str(nbd)
+
                     cncd = subscription.canceled_at
                     if cncd:
-                        row["cancel_date"] = self.__get_timestamp(cncd)
+                        row["cancel_date"] = str(cncd)
                     pending_change = subscription.pending_change
                     if pending_change:
                         row["pending_change"] = (
@@ -229,7 +223,12 @@ class RecurlyData:
 
                 for redemption in self.get_account_redemptions(account_id):
                     if redemption.state == "active":
-                        row["active_promo_code"] = redemption.coupon.code
+                        coupon = redemption.coupon
+                        code = coupon.code
+                        row["active_promo_code"] = code
+                        if row["pricing_amount"]:
+                            price = self.get_discounted_price(int(row["pricing_amount"]), coupon.discount)
+                            row["discounted_pricing_amount"] = price
 
                 self.recurly_data.append(row)
                 idx += 1
@@ -294,12 +293,33 @@ class RecurlyData:
 
         return cst_id
 
+    @staticmethod
+    def get_discounted_price(price: int, discount):
+        discount_type = discount.type
+        if discount_type == "percent":
+            price = int(
+                price - (price * discount.percent/100)
+            )
+        elif discount_type == "fixed":
+            price = int(
+                price - (discount.currencies[0].amount * 100)
+            )
+        return price
+
     def get_first_account_datetime(self):
         """Get datetime of the first record."""
         accounts = self.get_accounts(order="asc")
         # TODO: Catch exception recurly.ApiError, AttributeError etc
         account = next(accounts)
         return account.created_at
+
+    @staticmethod
+    def get_frequency_name(name: str):
+        """Get the frequency name."""
+        name = name.split(' ')[0]
+        if(name == "Annual"):
+            name = "Yearly"
+        return name
 
     def make_csv(self):
         """Make  a csv file from extracted data."""
