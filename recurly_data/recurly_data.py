@@ -142,7 +142,7 @@ class RecurlyData:
             elif endpoint == "accounts":
                 # refresh counts
                 self.__header_response()
-                response = self.client.list_accounts(**params).items()
+                response = self.client.list_accounts(**params, subscriber="true").items()
             elif endpoint == "subscriptions":
                 response = self.client.list_account_subscriptions(
                     **params
@@ -226,8 +226,9 @@ class RecurlyData:
                         coupon = redemption.coupon
                         code = coupon.code
                         row["active_promo_code"] = code
-                        price = self.get_discounted_price(row["pricing_amount"], coupon.discount)
-                        row["discounted_pricing_amount"] = price
+                        if row["pricing_amount"]:
+                            price = self.get_discounted_price(int(row["pricing_amount"]), coupon.discount)
+                            row["discounted_pricing_amount"] = price
 
                 self.recurly_data.append(row)
                 idx += 1
