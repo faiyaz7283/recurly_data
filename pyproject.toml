@@ -7,7 +7,7 @@ authors = ["Faiyaz Haider <faiyaz7283@gmail.com>"]
 [tool.poetry.dependencies]
 python = "^3.7"
 recurly = "^3.3"
-requests = "^2.22"
+requests = "^2.31"
 python-dotenv = "^0.10.3"
 sentry-sdk = "^0.13.5"
 tqdm = "^4.40"
